@@ -1,0 +1,615 @@
+---
+title: "Projet_MD 2025-2026"
+author: PATRICK NTWALI M.
+Date: May 2026
+format: 
+  html:
+    embed-resources: true   
+    self-contained: true    
+editor: visual
+---
+
+## Projet MD
+
+**Les données couvrent la periode de Septembre 2025 à Avril 2026**
+
+## ETAPE1. Traitement et nettoyage des données
+
+**1.1. importation des données et définition du répertoire des sorties**
+
+```{r}
+#| include: false
+# Ouvrir R dans le dossier de ce projet (voir README.md).
+output_dir <- file.path(getwd(), "sorties")#un dossiers pour stocker mes sorties
+if(!dir.exists(output_dir)) dir.create(output_dir, recursive = TRUE)
+
+library(readr)
+# Connexion via variables d’environnement ; voir .Renviron.example
+library(RMariaDB)
+
+#Table Temperature interieur
+
+LD_Site <- read_delim("LD.csv", 
+delim = ",", escape_double = FALSE, trim_ws = TRUE)
+
+
+#Table meteo
+
+weather <- read_delim("synopuccle.csv", 
+delim = ",", escape_double = FALSE, trim_ws = TRUE)
+
+
+#Table energy: je la recupere depuis le serveur Maria
+
+db_config <- Sys.getenv(c("LD_DB_USER", "LD_DB_HOST", "LD_DB_PASSWORD", "LD_DB_NAME"))
+if (any(!nzchar(db_config))) stop("Renseigner les variables LD_DB_* avant la connexion.")
+mgr<-MariaDB()
+con <- dbConnect(
+  mgr,
+  user = Sys.getenv("LD_DB_USER"),
+  host = Sys.getenv("LD_DB_HOST"),
+  password = Sys.getenv("LD_DB_PASSWORD"),
+  dbname = Sys.getenv("LD_DB_NAME"))
+  Energy <- dbGetQuery (con, "SELECT * FROM gas")
+```
+
+**1.2. Transformation des dates dans les 3 tables**
+
+Dans la table LD_Site, RoundedDate est deja dans le fuseau horaire locale. je m'assure seulement du bon format de date. c'est pas le cas pour dans la table weather, où timestamp est en UTC, je la remet dans le format locale Bruxelles avec la fonction with_tz et j'uniformise le nom. je fait pareil dans la table energy. j'ordonne les variables dans le bon ordre avec la variable de temps au debut. Je trie ensuite le tables par ordre chronologiquepour faciliter les analyses temporelles et les comparaisons entre séries.
+
+```{r}
+#| include: false
+
+library(lubridate)
+library(tidyverse)
+
+#Table LD_site (le timezone est deja bon)
+
+LD_Site <- LD_Site %>%
+  mutate(RoundedDate = mdy_hms(RoundedDate, tz = "Europe/Brussels"))
+
+#Table weather
+
+weather$RoundedDate <- with_tz(weather$timestamp, "Europe/Brussels")
+
+weather <- weather %>%
+  select(RoundedDate, temp, humidity_relative, wind_speed, pressure, timestamp)
+
+LD_Site <- LD_Site %>%
+  arrange(RoundedDate)
+
+weather <- weather %>%
+  arrange(timestamp)
+
+Energy <- Energy %>%
+  arrange(UTC)
+
+
+#Table Energie
+
+Energy$RoundedDate <- with_tz(Energy$UTC, tzone = "Europe/Brussels")
+Energy <-Energy %>%
+  select(RoundedDate, kWhm2, UTC)
+```
+
+**1.3. Traduction des categories de la variable Location**
+
+D'après la traduction:
+
+ONTHAAL → Salle d'accueil/reception
+
+STRAATZICHT → Vue sur la rue (Je me dis que c'est une chambre)
+
+TUINZICHT → Vue sur le jardin (Je me dis que c'est la chambre aussi)
+
+J'attribue ces nouvelles étiquettes directement à la variable location. Je sauve des copies des 3 tables nettoyés en CSV dans le dossier "sorties"
+
+```{r}
+#| include: false
+
+library(questionr)
+
+LD_Site$Location <- LD_Site$Location |>
+  fct_recode(
+    "Reception" = "ONTHAAL",
+    "Chambre_rue" = "STRAATZICHT",
+    "Chambre_Jardin" = "TUINZICHT")
+
+write_csv(LD_Site, file = file.path(output_dir,"LD_site_nettoye.csv"))
+write_csv(weather, file = file.path(output_dir,"weather_nettoye.csv"))
+write_csv(Energy, file = file.path(output_dir,"Energy_nettoye.csv"))
+```
+
+**1.4. Left_joint des 3 tables et creation de la base final LD**
+
+Je joint ces 3 tables avec comme clé de jointure RoundedDate uniformisé au meme fuseau horaire et meme format. cette base va me servir pour concevoir mon Dashboard - application shiny.
+
+```{r}
+#| include: false
+
+LD_weather_BD <- left_join(LD_Site, weather, by = "RoundedDate")
+LD_BD <- left_join(LD_weather_BD, Energy, by = "RoundedDate")
+
+LD_BD <- LD_BD %>%
+  select(-c(DateTime, timestamp, UTC))
+
+LD_BD <- LD_BD %>%
+  rename(
+    Date = RoundedDate,
+    TempInside = Temperature,
+    TempOutside = temp)
+
+save(LD_BD, file = file.path(output_dir, "LD_BD.Rda"))
+```
+
+**1.4. J'ajoute les colonnes Date, Heure, Jour de la semaine et semaine et mois dans la base final en prevision de la modelisation**
+
+J'ajoutes ces colonnes dans la base de donnée LD_BD en vue de la modelisation de l'effet des variables de temps : Heure et Jours de la semaine mais aussi la matrice de Heures x Jours de la semaine necessaire pour l'analyse des profils horaires dans l'ACP. la variable DayOfWeekNum est importante pour me permettre de d'ordonner les jours de la semaine si besoin.
+
+```{r}
+#| include: false
+
+add_time_columns <- function(data, datetime_column) {
+
+  dt <- data[[datetime_column]]
+
+  data$Date <- as.Date(dt)
+  data$Hour <- as.integer(format(dt, "%H"))
+  data$Hour_display <- ifelse(data$Hour == 0, 24, data$Hour)
+
+  #%u me donne lundi = 1, mardi = 2, ..., dimanche = 7.
+  data$DayOfWeekNum <- as.integer(format(dt, "%u"))
+
+  day_names <- c(
+    "Lundi", "Mardi", "Mercredi", "Jeudi",
+    "Vendredi", "Samedi", "Dimanche"
+  )
+  data$DayOfWeekName <- day_names[data$DayOfWeekNum]
+
+  # Debut de semaine: lundi.
+  data$WeekStart <- as.Date(data$Date - data$DayOfWeekNum + 1)
+
+  # Semaine ISO: par exemple 2025-W36.
+  data$YearWeek <- format(dt, "%G-W%V")
+
+  # Mois: par exemple 2025-09.
+  data$Month <- format(dt, "%Y-%m")
+
+  data
+}
+
+LD_BD <- add_time_columns(LD_BD, "Date")
+
+LD_BD <- LD_BD[, c(
+  "Date", "SensorID", "site", "Floor", "Location",
+  "TempInside", "TempOutside",
+  "humidity_relative", "wind_speed", "pressure", "kWhm2",
+  "Hour", "Hour_display", "DayOfWeekNum", "DayOfWeekName",
+  "WeekStart", "YearWeek", "Month"
+)]
+```
+
+**1.4. Je créé la table filtréé sur une pièce: "Chambre avec vue sur le Jardin"; en prevision de la modelisation:**
+
+Pour le modèle qui va lier les valeurs du capteur de la "chambre avec vu sur le jardin" aux variables météorologiques, à l’heure et au jour de la semaine. La pièce que je choisis est "Chambre avec vue sur le Jardin".
+
+```{r}
+#| include: false
+
+LD_BD_chambre <- filter(LD_BD, Location == "Chambre_Jardin")
+
+save(LD_BD_chambre, file = file.path(output_dir,"LD_BD_chambre.Rda"))
+
+```
+
+**1.5. Je créé une table LD_BD_chambre_daily - Table agrégé par jour (J'en aurai besoin pour la modelisation)**
+
+Ici je créé une nouvelle table appelée **LD_BD_chambre_daily**, qui a pour objectif de permettre l’analyse du lien entre la consommation énergétique journalière, la température extérieure et la température intérieure dans la chambre avec vue sur le jardin. pour ceci je prends les moyennes journalières. et je créé egalement la variable degrée jours. Si la température extérieure moyenne du jour est inférieure à 16,5 °C, on accumule la différence ; sinon la valeur est 0. Pourquoi cela: parce que le lien entre la consomation d'energie et la temperature n'est pas lineaire mais depends de du besoin en chauffage qui apparaît principalement lorsque la température extérieure descend sous un certain seuil.
+
+```{r}
+#| include: false
+
+# Cette table servira à analyser le lien:
+# consommation journaliere - temperature exterieure - temperature interieure dans la Chambre avec vue sur le Jardin
+
+LD_BD_chambre_daily <- LD_BD_chambre %>%
+  group_by(Date, SensorID, Location) %>%
+  summarise(
+    AvgTempInside = mean(TempInside, na.rm = TRUE),
+    AvgTempOutside = mean(TempOutside, na.rm = TRUE),
+    EnergyKWh = sum(kWhm2, na.rm = TRUE),
+    DegreeDays = max(0, 16.5 - mean(TempOutside, na.rm = TRUE)),
+    .groups = "drop"
+  ) %>%
+  arrange(Date) %>%
+  mutate(
+    AvgTempInside = round(AvgTempInside, 3),
+    AvgTempOutside = round(AvgTempOutside, 3),
+    EnergyKWh = round(EnergyKWh, 3)
+  )
+
+save(LD_BD_chambre_daily, file = file.path(output_dir, "LD_BD_chambre_daily.Rda"))
+```
+
+**1.5. Je créé la matrice LD_ProfiHoraire - (J'en aurai besoin pour l'explorartion des profils horaire durant la semaine)**
+
+Je vais travailler sur deux pièces de la maison: la chambre avec vue sur le Jardin" et la Salle d'accueil/reception". Pour cela, j'applique un filtre pour ne grader que les observations de ces deux pièces. ensuite je fait une aggregation sur la moyenne de temperature horaire pour chaque jour de la semaine et ce par pièces pour pouvoir comparer. j'obtiens une table en format long. que je transfoerme ensuite en format large/matrice heure x jours de la semaine avec la fonction pivot_wider. la variable DayofweekNum est importante ici pour ordonner les jours de la semaine dans la matrice. j'ai aussi transformé la variable heure en lignes pour qu'il ne serve pour la representataion des individu sans necessité d'entrer dans l'ACP.
+
+```{r}
+#| include: false
+
+LD_ProfiHoraire <- LD_BD %>%
+  filter(Location %in% c(
+    "Chambre_Jardin",
+    "Reception"
+  )) %>%
+  group_by(Location, DayOfWeekNum, DayOfWeekName, Hour) %>%
+  summarise(
+    TempInside_mean = mean(TempInside, na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  arrange(Location, DayOfWeekNum, Hour)
+
+## Je construit la matrice en prevision de l'ACP
+
+LD_ProfiHoraire_M <- LD_ProfiHoraire %>%
+  select(-DayOfWeekNum) %>%  
+  pivot_wider(
+    names_from = DayOfWeekName,
+    values_from = TempInside_mean
+  ) %>%
+  arrange(Location, Hour)
+
+LD_ProfiHoraire_M <- LD_ProfiHoraire_M %>%
+  unite(Location_time, Location, Hour, remove = TRUE) %>%
+  column_to_rownames("Location_time")
+
+save(LD_ProfiHoraire, file = file.path(output_dir, "LD_ProfiHoraire.Rda"))
+save(LD_ProfiHoraire_M, file = file.path(output_dir, "LD_ProfiHoraire_M.Rda"))
+
+```
+
+## 2. ETAPE 2: **Analyse de perspectives : Comparer les profil horaire de deux capteurs**
+
+Je realise une ACP pour visualiser les profis horaire qui se degage en comparaison dans les deux pièces la chambre avec vue sur le Jardin" et la Salle d'accueil/reception".
+
+**Choix des dimensions**
+
+Le graphique du coude de cattelme permet de decider du choix des dimmension à garder. la première dimension explique à elle seule 93,2 **%** de la variance. La deuxième dimension n’en explique que 5,4 %. Ensemble, les deux premières dimensions expliquent donc 98,6 **%** de l’information. Cela veut dire que le plan factoriel Dim1-Dim2 résume très bien les différences entre les profils horaires. je peux donc interpréter les graphiques principalement à partir de ces deux axes.
+
+L’ACP montre une deux profils horaire different entre les profils horaire de la semaine et ceux du week-end.
+
+sur le plan factoriel des indivisus, J'observe que les profils horaires de la chambre et de la réception sont différents.
+
+La chambre avec vue sur le jardin présente un profil plus homogène et plus groupé, surtout pendant la journée. La réception présente un profil plus dispersé, notamment entre 10h et 18h, ce qui peut refléter une plus grande variabilité liée aux activités, passages, ouvertures de portes ou fonctionnement de l’espace d’accueil.
+
+L'analyse de clustering permet de miex cerner encore les deux profils. Le cluster 1 regroupe surtout les heures de Chambre_Jardin, principalement les heures de journée et de soirée. Le cluster 2 regroupe surtout les points Reception, ainsi que certaines heures de nuit ou de début de journée.
+
+Pour resumer: un profil lié à la chambre avec vue sur le jardin, plus stable et orienté vers les heures de journée ; un profil lié à la réception, plus variable, probablement influencé par les flux de personnes et l’activité de l’établissement.
+
+```{r}
+#| echo: true
+library(FactoMineR)
+library(factoextra)
+library(ggplot2)
+
+if (!dir.exists("sorties/sorties_ACP")) {
+  dir.create("sorties/sorties_ACP")
+}
+
+theme_HT <- theme_minimal(base_size = 12) +
+  theme(
+    plot.title = element_text(face = "bold", size = 15, hjust = 0.5),
+    plot.subtitle = element_text(size = 11, hjust = 0.5),
+    legend.title = element_text(face = "bold"),
+    panel.grid.minor = element_blank()
+  )
+
+palette_clusters <- c("#1B9E77", "#D95F02", "#7570B3", "#E7298A")
+
+######## ACP
+
+res.PCA_HT <- PCA(
+  LD_ProfiHoraire_M,
+  scale.unit = TRUE,
+  ncp = 2,
+  graph = FALSE,
+  axes = c(1, 2)
+)
+
+eig_HT <- as.data.frame(res.PCA_HT$eig)
+
+# Coude de Cattell : part de variance expliquee par chaque dimension
+cattel_HT <- fviz_eig(
+  res.PCA_HT,
+  addlabels = TRUE,
+  barfill = "#2C7FB8",
+  barcolor = "#2C7FB8",
+  linecolor = "#F03B20",
+  main = "Variance expliquée par les dimensions",
+  xlab = "Dimensions",
+  ylab = "Pourcentage de variance expliquée"
+) +
+  theme_HT
+
+#### Plans factoriels
+##des variables
+
+Plan_fac_HT <- fviz_pca_var(
+  res.PCA_HT,
+  axes = c(1, 2),
+  col.var = "cos2",
+  gradient.cols = c("#2C7FB8", "#FEE08B", "#D7191C"),
+  repel = TRUE,
+  title = "Deux tendances hebdomadaires"
+) +
+  labs(
+    subtitle = "En semaine VS Weekends",
+    color = "Qualite de representation"
+  ) +
+  theme_HT
+
+##Des individus
+
+ind_plan_HT <- fviz_pca_ind(
+  res.PCA_HT,
+  axes = c(1, 2),
+  label = "all",
+  repel = TRUE,
+  pointshape = 19,
+  col.ind = "cos2",
+  gradient.cols = c("#2C7FB8", "#FEE08B", "#D7191C"),
+  title = "Profils horaire de la temperature"
+) +
+  labs(
+    subtitle = "Selon les capteurs en chambre avec vue sur le jardin et la salle d'accueil",
+    color = "Qualite de representation"
+  ) +
+  theme_HT
+
+
+######## Clustering
+
+clust_km_HT <- kmeans(
+  x = LD_ProfiHoraire_M,
+  centers = 2,
+  nstart = 25,
+  algorithm = "Hartigan-Wong",
+  iter.max = 10
+)
+
+resultats_clusters_HT <- data.frame(
+  Individu = rownames(LD_ProfiHoraire_M),
+  Cluster = factor(clust_km_HT$cluster),
+  Dim1 = res.PCA_HT$ind$coord[, 1],
+  Dim2 = res.PCA_HT$ind$coord[, 2],
+  row.names = NULL
+)
+
+centres_clusters_HT <- as.data.frame(clust_km_HT$centers)
+centres_clusters_HT$Cluster <- rownames(centres_clusters_HT)
+
+
+##### Visualisation du clustering
+
+clustrering_HT <- fviz_cluster(
+  clust_km_HT,
+  data = LD_ProfiHoraire_M,
+  palette = palette_clusters,
+  geom = c("point", "text"),
+  repel = TRUE,
+  ellipse.type = "convex",
+  ggtheme = theme_minimal(base_size = 12),
+  main = "Deux profils horaires selon les capteurs: En semaine VS Weekends"
+) +
+  labs(
+    subtitle = "",
+    color = "Cluster",
+    fill = "Cluster"
+  ) +
+  theme_HT
+
+
+######## Export des graphiques
+
+ggsave(file.path(output_dir, "01_coude_cattell.png"), cattel_HT,      width = 8, height = 5, dpi = 300)
+ggsave(file.path(output_dir, "02_plan_variables.png"),Plan_fac_HT,    width = 8, height = 6, dpi = 300)
+ggsave(file.path(output_dir, "03_plan_individus_cos2.png"),ind_plan_HT,    width = 9, height = 6, dpi = 300)
+ggsave(file.path(output_dir, "04_clustering_kmeans.png"), clustrering_HT, width = 8, height = 6, dpi = 300)
+```
+
+## 3. ETAPE 3: **Modelisation :**
+
+**3.1. Est-ce que la température intérieure d’un capteur dépend surtout de l’heure/jour, ou aussi de la météo extérieure ? :** TempInside \~ TempOutside + humidity_relative + wind_speed + pressure + hour + weekday
+
+**Model 1: Effet de la météo à heure et jour de semaine contrôlés (modèle complet)**
+
+```{r}
+
+model_complet <- lm(
+  TempInside ~ TempOutside + humidity_relative + wind_speed + pressure +
+    factor(Hour) + DayOfWeekName,
+  data = LD_BD_chambre)
+
+summary(model_complet)
+
+#le diagnostics
+
+par(mfrow = c(2, 2))
+plot(model_complet)
+
+#Les hypothèses de normalité, d'independance des observation et d'homogeneité de variance sont respectés.
+#Résidus vs Valeurs Ajustées — Dispersion aléatoire autour de zéro, ligne plate : linéarité et homoscédasticité respectées:
+
+#Q-Q des Résidus : Bon suivi de la diagonale au centre, il ya des queues un peu lourdes : mais ca passe.
+
+#Échelle-Location : Dispersion uniforme et ligne plate : homoscédasticité confirmée.
+
+#Résidus vs Levier: Points concentrés à faible levier, aucun ne dépasse la distance de Cook : pas d'observation influente.
+
+```
+
+**Model 1: Interpretation**
+
+La météo joue un rôle, mais pas toutes les variables météo. La température extérieure n’est pas significative (p-value = 0.1608). Donc, une fois qu’on contrôle l’heure,le jour, l’humidité, le vent et la pression, la température extérieure n'explique pas la température intérieure.
+
+L’humidité relative est significative(p-value \< 2e-16). Quand l’humidité augmente de 1 point, la température intérieure augmente en moyenne d’environ 0.011°C, toutes choses égales par ailleurs. L’effet est statistiquement net.
+
+La vitesse du vent n'est pas significative (p-value = 0.4367). la pression non plus (p-value = 0.1662)
+
+L’heure joue un rôle fort. Les coefficients factor(Hour) sont souvent significatifs, surtout entre 8h et 20h.
+
+Par rapport à l’heure de référence (minuit), les températures intérieures sont significativement plus élevées à 8h (p = 7.82e-12), 10h (p \< 2e-16), 12h (p \< 2e-16), 14h (p \< 2e-16), 16h (p \< 2e-16), 18h (p \< 2e-16), 20h (p = 6.88e-11) et 22h (p = 0.0139). Ce qui montre l’existence d’un profil horaire marqué comme nous l'avaons demontré dans les analyses factorieelles.
+
+Par contre il n’y a pas de différence nette entre les jours de semaine, une fois l’heure et la météo prises en compte. les p-valeurs sont \> 0,05)
+
+le R-squared ajusté est de 0.2478, Le modèle explique environ 25 % de la variabilité de la température intérieure. c'est pas mal mais pas très grand. ca veux dire qu'il reste une grande partie des variations non expliqués.
+
+Dans le contexte d’une chambre de maison de repos en Flandre, la température intérieure ne dépend pas uniquement de la météo extérieure. Elle peut être fortement influencée par la régulation thermique du bâtiment, mise en place pour garantir le confort et la sécurité des résidents. La réglementation flamande impose notamment que, dans les espaces de séjour des woonzorgcentra, dont les chambres des résidents, la température atteigne au moins **22 °C pendant la journée**. Les textes prévoient aussi que toutes les mesures utiles soient prises pour éviter une température trop élevée, avec une limite de référence de 26 °C, ou 27 °C dans certaines formulations plus anciennes des normes d’infrastructure.
+
+Ainsi, si la chambre observée présente souvent des températures autour de 24-26 °C, cela n’est pas nécessairement anormal. Ces valeurs peuvent correspondre à une stratégie de maintien du confort thermique pour des personnes âgées, plus sensibles au froid. Le fait que la température extérieure ne soit pas significative dans le modèle peut donc indiquer que la chambre est régulée pour rester dans une zone de confort, plutôt que de suivre directement les variations météorologiques extérieures. Les variations restantes peuvent provenir de facteurs locaux : emplacement du capteur, exposition côté jardin, ouverture de la fenêtre, fonctionnement du chauffage ou de la ventilation, ou encore éventuel problème de mesure du capteur.
+
+**Model 2: Est ce que la meteo et plus précisement l'humidité relative apporte vraiment quelque chose de significatif dans l'explication des temperatures interieurs** ? je continue dans la suite des resultats ci- haut
+
+**Comparaison de M2a: Modèle sans météo et de M2b: Modèle avec météo**
+
+```{r}
+
+LD_BD_chambre <- LD_BD_chambre %>% #une ligne est implete sur quelques vars
+  filter(#pour comparer avec l'AIC j'ai besoin des memes données
+    !is.na(TempInside),
+    !is.na(Hour),
+    !is.na(DayOfWeekName),
+    !is.na(TempOutside),
+    !is.na(humidity_relative),
+    !is.na(wind_speed),
+    !is.na(pressure))
+
+#M2a: Modèle sans météo
+
+model_time <- lm(
+  TempInside ~ factor(Hour) + DayOfWeekName,
+  data = LD_BD_chambre)
+
+summary(model_time) 
+
+#M2b: Modèle avec météo
+
+model_weather <- lm(
+  TempInside ~ TempOutside + humidity_relative + wind_speed + pressure +
+    factor(Hour) + DayOfWeekName,
+  data = LD_BD_chambre)
+
+summary(model_weather) 
+
+#Comparaison des deux modeles
+
+AIC(model_time, model_weather)
+
+```
+
+**3.1. Analyse de la relation entre consommation de gaz, température extérieure et température moyenne intérieure :** EnergyKWh \~ AvgTempOutside + AvgTempInside. ici je vais plutot utiliser le degré-jours parce ce que contrairement à la température extérieure brute, les degrés-jours tiennent compte du fait que le chauffage n’est généralement pas utilisé lorsque les températures sont suffisamment élevées. Ils permettentdonc de modéliser plus fidèlement la relation entre la meteo et la consommation d'energie.
+
+```{r}
+
+model_gas <- lm(
+  EnergyKWh ~ DegreeDays + AvgTempInside,
+  data = LD_BD_chambre_daily)
+
+summary(model_gas)
+
+par(mfrow = c(2, 2))
+plot(model_gas)
+par(mfrow = c(1, 1))
+
+#Representation sur graphique de ces liens
+
+#Je defini un thème pour mes graphs en ggplot
+
+theme_ld <- theme_minimal(base_size = 13) +
+  theme(
+    plot.title = element_text(face = "bold", size = 15, color = "#173333"),
+    plot.subtitle = element_text(size = 11, color = "#637574"),
+    axis.title = element_text(color = "#294747"),
+    axis.text = element_text(color = "#405252"),
+    panel.grid.minor = element_blank(),
+    panel.grid.major = element_line(color = "#e2e8e6"),
+    plot.background = element_rect(fill = "#fbfcfc", color = NA),
+    panel.background = element_rect(fill = "#fbfcfc", color = NA))
+
+
+#Graph 1: Consommation de gaz et beson en chauffage
+
+ggplot(LD_BD_chambre_daily, aes(DegreeDays, EnergyKWh)) +
+  geom_point(
+    color = "#245c5f",
+    fill = "#7fc8a9",
+    shape = 21,
+    size = 2.8,
+    alpha = 0.75,
+    stroke = 0.4
+  ) +
+  geom_smooth(
+    method = "lm",
+    se = TRUE,
+    color = "#f28f3b",
+    fill = "#f28f3b",
+    alpha = 0.18,
+    linewidth = 1
+  ) +
+  labs(
+    title = "Consommation de gaz et besoin de chauffage",
+    subtitle = "Relation entre les degrés-jours et la consommation journalière",
+    x = "Degrés-jours de chauffage",
+    y = "Consommation de gaz"
+  ) +
+  theme_ld
+
+#Graph 1: Consommation de gaz et temperature intérieure
+
+ggplot(LD_BD_chambre_daily, aes(AvgTempInside, EnergyKWh)) +
+  geom_point(
+    color = "#245c5f",
+    fill = "#7fc8a9",
+    shape = 21,
+    size = 2.8,
+    alpha = 0.75,
+    stroke = 0.4
+  ) +
+  geom_smooth(
+    method = "lm",
+    se = TRUE,
+    color = "#f28f3b",
+    fill = "#f28f3b",
+    alpha = 0.18,
+    linewidth = 1
+  ) +
+  labs(
+    title = "Consommation de gaz et température intérieure",
+    subtitle = "Relation entre la température intérieure moyenne et la consommation journalière",
+    x = "Température intérieure moyenne journalière (°C)",
+    y = "Consommation de gaz"
+  ) +
+  theme_ld
+
+```
+
+Ces diagnostics du modèle sont globalement acceptables, mais ils montrent quelques petites limites du modèle:
+
+**a. Residuals vs Fitted**
+
+Le nuage est centré autour de 0, ce qui est bon. Il n’y a pas de forme très marquée, donc le modèle linéaire semble raisonnable.
+
+**b. Q-Q Residuals**
+
+Les points suivent assez bien la ligne droite, surtout au centre. Aux extrémités, quelques points s’éloignent un peu.
+
+ça veut dire que les résidus sont à peu près normaux, mais avec quelques valeurs plus extrêmes que prévu. Ce n’est pas très inquiétant ici.
+
+**c. Scale-Location**
+
+Les points sont globalement répartis de façon assez homogène. La variance des résidus semble donc plutôt stable.
+
+**d. Residuals vs Leverage**
+
+Quelques points sont plus influents, mais aucun ne semble dépasser fortement les seuils de Cook’s distance. Donc il n’y a pas de point extrêmement problématique qui domine complètement le modèle.

@@ -1,0 +1,5 @@
+# Conserver les fins de ligne des fichiers importes par l'interface GitHub.
+* -text
+*.pdf binary
+*.pptx binary
+*.png binary
